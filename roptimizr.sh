@@ -118,89 +118,86 @@ apply_fix() {
 
 for namespace in $(kubectl $kubeconfig get namespaces | tail -n +2 | awk '{print $1}' | grep -v -w -E "${exclude_namespaces//,/|}")
 do
-  for p in $(kubectl $kubeconfig get pod -n $namespace | grep Running | awk '{print $1}')
+  for pod in $(kubectl $kubeconfig get pod -n "$namespace" | grep Running | awk '{print $1}')
   do
-    for container in $(kubectl $kubeconfig get pod -n $namespace $p -o jsonpath='{.spec.containers[*].name}')
+    for container in $(kubectl $kubeconfig get pod -n "$namespace" "$pod" -o jsonpath='{.spec.containers[*].name}')
     do
       if kubectl $kubeconfig get pod -n $namespace $p -o jsonpath='{.metadata.annotations.forbid_rl_modification}' | grep -q "yes"; then
         continue
       fi
-      # Modify the loop where you fetch cpulimit, cpurequest, memlimit, and memrequest:
-      cpulimit=$(kubectl $kubeconfig -n $namespace get pod $p -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.limits.cpu}")
-      cpurequest=$(kubectl $kubeconfig -n $namespace get pod $p -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.requests.cpu}")
-      memlimit=$(kubectl $kubeconfig -n $namespace get pod $p -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.limits.memory}")
-      memrequest=$(kubectl $kubeconfig -n $namespace get pod $p -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.requests.memory}")
+		# Fetch resource limits and requests
+		cpulimit=$(kubectl $kubeconfig -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.limits.cpu}")
+		cpurequest=$(kubectl $kubeconfig -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.requests.cpu}")
+		memlimit=$(kubectl $kubeconfig -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.limits.memory}")
+		memrequest=$(kubectl $kubeconfig -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.requests.memory}")
 
-      cpulimit_millicores=$(convert_cpu_to_millicores "$cpulimit")
-      cpurequest_millicores=$(convert_cpu_to_millicores "$cpurequest")
-      memlimit_Mi=$(convert_memory_to_Mi "$memlimit")
-      memrequest_Mi=$(convert_memory_to_Mi "$memrequest")
-      #mem_go_real=$(curl --silent -G '//https://prometheus.company.com/api/v1/query' --data-urlencode 'query=sum(container_memory_working_set_bytes{job="kubelet", metrics_path="/metrics/cadvisor", cluster="", namespace="$namespace", pod="$p", container!="", image!=""}) by (container)' | jq -r '.data.result[].value[1]' | awk '{sum = $1 + $2; printf("%.4f\n", sum/1024/1024/1024)}')
-
-
-      if [ -z "$cpulimit_millicores" ] || [ -z "$cpurequest_millicores" ] || [ -z "$memlimit_Mi" ] || [ -z "$memrequest_Mi" ]; then
-        continue
-      fi
-
-      cpu_real=$(kubectl $kubeconfig top pod -n $namespace $p|grep $p|awk '{print $2}')
-      mem_real=$(kubectl $kubeconfig top pod -n $namespace $p|grep $p|awk '{print $3}')
-
-      #cpu_real=$(kubectl $kubeconfig top pod -n $namespace $p | tail -n +2 | grep $p | awk '{print $2}')
-      #mem_real=$(kubectl $kubeconfig top pod -n $namespace $p | tail -n +2 | grep $p | awk '{print $3}')
-
-      cpu_real_millicores=$(convert_cpu_to_millicores "$cpu_real")
-      mem_real_Mi=$(convert_memory_to_Mi "$mem_real")
-
-      cpu_needs_fix=0
-      mem_needs_fix=0
-
-      # Check for missing data and set to 0
-      if [ -z "$cpu_real_millicores" ]; then
-        cpu_real_millicores=0
-      fi
-
-      if [ -z "$mem_real_Mi" ]; then
-        mem_real_Mi=0
-      fi
-
-      if [ -z "$mem_go_real" ]; then
-        mem_go_real=0
-      fi
+		cpulimit_millicores=$(convert_cpu_to_millicores "$cpulimit")
+		cpurequest_millicores=$(convert_cpu_to_millicores "$cpurequest")
+		memlimit_Mi=$(convert_memory_to_Mi "$memlimit")
+		memrequest_Mi=$(convert_memory_to_Mi "$memrequest")
+		#mem_go_real=$(curl --silent -G '//https://prometheus.company.com/api/v1/query' --data-urlencode 'query=sum(container_memory_working_set_bytes{job="kubelet", metrics_path="/metrics/cadvisor", cluster="", namespace="$namespace", pod="$p", container!="", image!=""}) by (container)' | jq -r '.data.result[].value[1]' | awk '{sum = $1 + $2; printf("%.4f\n", sum/1024/1024/1024)}')
 
 
-      cpu_limit_too_high=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "high")
-      cpu_request_too_high=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "high")
-      mem_limit_too_high=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "high")
-      mem_request_too_high=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "high")
+		if [ -z "$cpulimit_millicores" ] || [ -z "$cpurequest_millicores" ] || [ -z "$memlimit_Mi" ] || [ -z "$memrequest_Mi" ]; then
+		continue
+		fi
 
-      cpu_limit_too_low=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "low")
-      cpu_request_too_low=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "low")
-      mem_limit_too_low=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "low")
-      mem_request_too_low=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "low")
+	    # Get real CPU and memory usage (from 'kubectl top' output)
+	    read -r cpu_real mem_real rest_of_line <<< $(kubectl $kubeconfig top pod -n "$namespace" "$pod" | grep "$pod" | awk '{print $2, $3}')
 
+	    cpu_real_millicores=$(convert_cpu_to_millicores "$cpu_real")
+	    mem_real_Mi=$(convert_memory_to_Mi "$mem_real")
 
-      if [ "$verbose" -eq 1 ]; then
-        echo "namespace: $namespace"
-        echo "cpulimit: $cpulimit"
-        echo "cpulimit_millicors: $cpulimit_millicores"
-        echo "cpurequest: $cpurequest"
-        echo "memlimit: $memlimit"
-        echo "memlimit_Mi: $memlimit_Mi"
-        echo "memrequest: $memrequest"
-        echo "memrequest_Mi: $memrequest_Mi"
-        echo "memlimit_Mi: $memlimit_Mi"
-        echo "cpurequest_millicores: $cpurequest_millicores"
-        echo "mem_go_real: $mem_go_real"
-        echo "cpu_real: $cpu_real"
-        echo "mem_real: $mem_real"
-        echo "cpu_needs_fix: $cpu_needs_fix"
-        echo "mem_needs_fix: $mem_needs_fix"
-      fi
+		cpu_needs_fix=0
+		mem_needs_fix=0
+
+		# Check for missing data and set to 0
+		if [ -z "$cpu_real_millicores" ]; then
+		cpu_real_millicores=0
+		fi
+
+		if [ -z "$mem_real_Mi" ]; then
+		mem_real_Mi=0
+		fi
+
+		if [ -z "$mem_go_real" ]; then
+		mem_go_real=0
+		fi
 
 
-      if [ "$cpu_limit_too_low" = "1" ] || [ "$cpu_request_too_low" = "1" ] || [ "$mem_limit_too_low" = "1" ] || [ "$mem_request_too_low" = "1" ] || [ "$cpu_limit_too_high" = "1" ] || [ "$cpu_request_too_high" = "1" ] || [ "$mem_limit_too_high" = "1" ] || [ "$mem_request_too_high" = "1" ]; then
-        apply_fix "$namespace" "$p" "$container" "$cpulimit_millicores" "$memlimit_Mi" "$cpu_real_millicores" "$mem_real_Mi"
-      fi
+		cpu_limit_too_high=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "high")
+		cpu_request_too_high=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "high")
+		mem_limit_too_high=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "high")
+		mem_request_too_high=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "high")
+
+		cpu_limit_too_low=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "low")
+		cpu_request_too_low=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "low")
+		mem_limit_too_low=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "low")
+		mem_request_too_low=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "low")
+
+
+		if [ "$verbose" -eq 1 ]; then
+		echo "namespace: $namespace"
+		echo "cpulimit: $cpulimit"
+		echo "cpulimit_millicors: $cpulimit_millicores"
+		echo "cpurequest: $cpurequest"
+		echo "memlimit: $memlimit"
+		echo "memlimit_Mi: $memlimit_Mi"
+		echo "memrequest: $memrequest"
+		echo "memrequest_Mi: $memrequest_Mi"
+		echo "memlimit_Mi: $memlimit_Mi"
+		echo "cpurequest_millicores: $cpurequest_millicores"
+		echo "mem_go_real: $mem_go_real"
+		echo "cpu_real: $cpu_real"
+		echo "mem_real: $mem_real"
+		echo "cpu_needs_fix: $cpu_needs_fix"
+		echo "mem_needs_fix: $mem_needs_fix"
+		fi
+
+
+        if [ "$cpu_limit_too_low" = "1" ] || [ "$cpu_request_too_low" = "1" ] || [ "$mem_limit_too_low" = "1" ] || [ "$mem_request_too_low" = "1" ] || [ "$cpu_limit_too_high" = "1" ] || [ "$cpu_request_too_high" = "1" ] || [ "$mem_limit_too_high" = "1" ] || [ "$mem_request_too_high" = "1" ]; then
+            apply_fix "$namespace" "$pod" "$container" "$cpulimit_millicores" "$memlimit_Mi" "$cpu_real_millicores" "$mem_real_Mi" "$cpurequest_millicores" "$memrequest_Mi" 
+        fi
 
     done
   done
@@ -210,4 +207,3 @@ echo "Total request millicores needed to apply the patches: $total_cpu_needed_re
 echo "Total request Mi needed to apply the patches: $total_mem_needed_request"
 echo "Total limit millicores needed to apply the patches: $total_cpu_needed_limit"
 echo "Total limit Mi needed to apply the patches: $total_mem_needed_limit"
-
