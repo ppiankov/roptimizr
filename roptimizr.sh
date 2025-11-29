@@ -170,16 +170,16 @@ apply_fix() {
   echo "Container:         $container"
   echo
   echo "Current Resources:"
-  echo "  CPU:             request=${cpurequest_millicores}m   limit=${cpulimit_millicores}m"
-  echo "  Memory:          request=${memrequest_Mi}Mi          limit=${memlimit_Mi}Mi"
+  printf "  CPU:             request=%-7s limit=%-7s\n"  "${cpurequest_millicores}m" "${cpulimit_millicores}m"
+  printf "  Memory:          request=%-7s limit=%-7s\n"  "${memrequest_Mi}Mi"        "${memlimit_Mi}Mi"
   echo
   echo "Observed Usage (pod-level):"
-  echo "  CPU actual:      ${cpu_real_millicores}m"
-  echo "  Memory actual:   ${mem_real_Mi}Mi"
+  printf "  CPU actual:      %-7s\n"  "${cpu_real_millicores}m"
+  printf "  Memory actual:   %-7s\n"  "${mem_real_Mi}Mi"
   echo
   echo "Suggested New Resources:"
-  echo "  CPU:             request=${new_cpurequest}m   limit=${new_cpulimit}m"
-  echo "  Memory:          request=${new_memrequest}Mi  limit=${new_memlimit}Mi"
+  printf "  CPU:             request=%-7s limit=%-7s\n"  "${new_cpurequest}m"  "${new_cpulimit}m"
+  printf "  Memory:          request=%-7s limit=%-7s\n"  "${new_memrequest}Mi" "${new_memlimit}Mi"
   echo
   echo "Reason:"
   local printed_reason=0
