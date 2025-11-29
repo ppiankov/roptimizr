@@ -1,47 +1,109 @@
 #!/bin/bash
 
-# Variables
-scaling_factor=1.3
-verbose=0
+# roptimizr.sh
+# Scan Kubernetes pods, find "dying" or CPU-hot containers,
+# and recommend updated CPU/memory requests/limits.
+# Also:
+# - Summarize total current vs suggested CPU/mem
+# - Compare to cluster allocatable resources
+# - Count pods with no resource limits set
+
+# --- Config ------------------------------------------------------------------
+
+scaling_factor=1.3        # how aggressively to scale vs real usage
+verbose=0                 # set to 1 for noisy debug output
 exclude_namespaces="kube-node-lease,kube-system"
-total_cpu_needed=0
-total_mem_needed=0
-kubeconfig=""
-#kubeconfig="--kubeconfig=/path/to/.kube/config"
 
+# Kubeconfig handling:
+# Option A (recommended): rely on env KUBECONFIG or current context
+# Option B (for scared humans): set kubeconfig_path explicitly:
+#   kubeconfig_path="/Users/you/.kube/cluster-config"
+kubeconfig_path=""
 
-# Function to convert CPU units to millicores
+# When is a pod "interesting" enough to look at?
+CPU_HOT_THRESHOLD_PCT=80  # % of CPU limit usage to call it "hot"
+RESTART_THRESHOLD=1       # restartCount >= this => dying/suspect
+
+# Totals for capacity planning (current)
+baseline_total_request_cpu_m=0
+baseline_total_limit_cpu_m=0
+baseline_total_request_mem_Mi=0
+baseline_total_limit_mem_Mi=0
+
+# Totals for deltas after applying recommendations
+total_cpu_needed_request=0
+total_mem_needed_request=0
+total_cpu_needed_limit=0
+total_mem_needed_limit=0
+
+# Cluster-wide allocatable
+cluster_allocatable_cpu_m=0
+cluster_allocatable_mem_Mi=0
+
+# Pods with no limits set on any container
+pods_without_limits=0
+
+# --- kubectl wrapper ---------------------------------------------------------
+
+# Use an array so flags are handled safely
+KCTL=(kubectl)
+if [[ -n "$kubeconfig_path" ]]; then
+  KCTL=(kubectl --kubeconfig="$kubeconfig_path")
+fi
+
+# --- Helpers -----------------------------------------------------------------
+
 convert_cpu_to_millicores() {
   local value=$1
-  if [[ $value == *m ]]; then
+
+  if [[ -z "$value" ]]; then
+    echo ""
+    return
+  fi
+
+  if [[ "$value" == *m ]]; then
     echo "${value%m}"
   else
-    echo $(( value * 1000 ))
+    awk -v v="$value" 'BEGIN {printf("%.0f\n", v * 1000)}'
   fi
 }
 
-# Function to convert memory units to Mi
 convert_memory_to_Mi() {
   local value=$1
-  if [[ $value == *Mi ]]; then
+
+  if [[ -z "$value" ]]; then
+    echo ""
+    return
+  fi
+
+  if [[ "$value" == *Mi ]]; then
     echo "${value%Mi}"
-  elif [[ $value == *Gi ]]; then
-    echo $(( ${value%Gi} * 1024 ))
+  elif [[ "$value" == *Gi ]]; then
+    awk -v v="${value%Gi}" 'BEGIN {printf("%.0f\n", v * 1024)}'
+  elif [[ "$value" == *Ki ]]; then
+    awk -v v="${value%Ki}" 'BEGIN {printf("%.0f\n", v / 1024)}'
   else
-    echo $value
+    echo "$value"
   fi
 }
 
-# Function to check if the resource needs fixing
 needs_fix() {
   local real=$1
   local value=$2
-  local scaling_factor=$3
+  local sf=$3
   local direction=$4
+
+  if [[ -z "$real" || -z "$value" || -z "$sf" ]]; then
+    echo 0
+    return
+  fi
+
   if [ "$direction" == "high" ]; then
-    echo "$real $value $scaling_factor" | awk '{if ( $1 * $3 < $2 ) print 1; else print 0;}'
+    echo "$real $value $sf" | awk '{if ($1 * $3 < $2) print 1; else print 0;}'
   elif [ "$direction" == "low" ]; then
-    echo "$real $value $scaling_factor" | awk '{if ( $1 > $2 * $3 ) print 1; else print 0;}'
+    echo "$real $value $sf" | awk '{if ($1 > $2 * $3 ) print 1; else print 0;}'
+  else
+    echo 0
   fi
 }
 
@@ -49,161 +111,268 @@ apply_fix() {
   local namespace=$1
   local pod=$2
   local container=$3
-  local cpulimit=$4
-  local memlimit=$5
-  local cpu_real=$6
-  local mem_real=$7
 
-  # Calculate new limits and requests
+  local cpulimit_millicores=$4
+  local memlimit_Mi=$5
+  local cpu_real_millicores=$6
+  local mem_real_Mi=$7
+  local cpurequest_millicores=$8
+  local memrequest_Mi=$9
 
-  local new_cpulimit=$(awk -v cpu="$cpu_real" -v sf="$scaling_factor" 'BEGIN {printf("%.0f", cpu * sf * 1.3)}')
-  local new_cpurequest=$(awk -v cpu="$cpu_real" 'BEGIN {printf("%.0f", cpu)}')
-  local new_memlimit=$(awk -v mem="$mem_real" -v sf="$scaling_factor" 'BEGIN {printf("%.0f", mem * sf * 1.3)}')
-  local new_memrequest=$(awk -v mem="$mem_real" 'BEGIN {printf("%.0f", mem)}')
+  local new_cpulimit
+  local new_cpurequest
+  local new_memlimit
+  local new_memrequest
 
-  if [ $new_cpulimit -lt 10 ]; then
-     new_cpulimit=10
-  fi
-  if [ $new_cpurequest -lt 10 ]; then
-     new_cpurequest=10
-  fi
-  if [ $new_memlimit -lt 10 ]; then
-     new_memlimit=10
-  fi
+  new_cpulimit=$(awk -v cpu="$cpu_real_millicores" -v sf="$scaling_factor" 'BEGIN {printf("%.0f", cpu * sf * 1.3)}')
+  new_cpurequest=$(awk -v cpu="$cpu_real_millicores" 'BEGIN {printf("%.0f", cpu)}')
+  new_memlimit=$(awk -v mem="$mem_real_Mi" -v sf="$scaling_factor" 'BEGIN {printf("%.0f", mem * sf * 1.3)}')
+  new_memrequest=$(awk -v mem="$mem_real_Mi" 'BEGIN {printf("%.0f", mem)}')
 
-  if [ $new_memrequest -lt 10 ]; then
-     new_memrequest=10
-  fi
+  [ "$new_cpulimit"    -lt 10 ] && new_cpulimit=10
+  [ "$new_cpurequest"  -lt 10 ] && new_cpurequest=10
+  [ "$new_memlimit"    -lt 10 ] && new_memlimit=10
+  [ "$new_memrequest"  -lt 10 ] && new_memrequest=10
 
-  if [ $new_cpulimit -eq $new_cpurequest ]; then
-     new_cpulimit=$(awk -v mem="$new_cpulimit" -v sf="$scaling_factor" 'BEGIN {printf("%.0f", mem * sf * 1.3)}')
+  if [ "$new_cpulimit" -eq "$new_cpurequest" ]; then
+    new_cpulimit=$(awk -v cpu="$new_cpulimit" -v sf="$scaling_factor" 'BEGIN {printf("%.0f", cpu * sf * 1.3)}')
   fi
 
-  if [ $new_memlimit -eq $new_memrequest ]; then
-     new_memlimit=$(awk -v mem="$mem_real" -v sf="$new_memlimit" 'BEGIN {printf("%.0f", mem * sf * 1.3)}')
+  if [ "$new_memlimit" -eq "$new_memrequest" ]; then
+    new_memlimit=$(awk -v mem="$new_memlimit" -v sf="$scaling_factor" 'BEGIN {printf("%.0f", mem * sf * 1.3)}')
   fi
- 
 
+  total_cpu_needed_request=$((total_cpu_needed_request + new_cpurequest - cpurequest_millicores))
+  total_mem_needed_request=$((total_mem_needed_request + new_memrequest - memrequest_Mi))
 
-  # Update total_cpu_needed and total_mem_needed
-  total_cpu_needed_request=$((total_cpu_needed + new_cpurequest - cpurequest_millicores))
-  total_mem_needed_request=$((total_mem_needed + new_memrequest - memrequest_Mi))
+  total_cpu_needed_limit=$((total_cpu_needed_limit + new_cpulimit - cpulimit_millicores))
+  total_mem_needed_limit=$((total_mem_needed_limit + new_memlimit - memlimit_Mi))
 
-  total_cpu_needed_limit=$((total_cpu_needed + new_cpulimit - cpulimit_millicores))
-  total_mem_needed_limit=$((total_mem_needed + new_memlimit - memlimit_Mi))
+  # Recompute high/low flags for explanation text
+  local cpu_limit_too_high cpu_request_too_high mem_limit_too_high mem_request_too_high
+  local cpu_limit_too_low cpu_request_too_low mem_limit_too_low mem_request_too_low
 
+  cpu_limit_too_high=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "high")
+  cpu_request_too_high=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "high")
+  mem_limit_too_high=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "high")
+  mem_request_too_high=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "high")
 
-  # uncomment if need to apply the changes
-  # Apply changes to the deployment manifest
-  # kubectl $kubeconfig -n "$namespace" patch pod "$pod" -p "$(cat <<EOF
-  # spec:
-  # containers:
-  # - name: $container_name
-  #     resources:
-  #     limits:
-  #         cpu: "${new_cpu_limit}m"
-  #         memory: "${new_mem_limit}Mi"
-  # EOF
-  # )"
-  #echo "Applied fix: $namespace/$pod/$container_name -> CPU: ${new_cpurequest}m/${new_cpulimit}m, Memory: ${new_memrequest}Mi/${new_memlimit}Mi"
-  #echo "Applied fix: $namespace/$pod/$container_name -> CPU: ${new_cpu_limit}m, Memory: ${new_mem_limit}Mi"
-  # }
+  cpu_limit_too_low=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "low")
+  cpu_request_too_low=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "low")
+  mem_limit_too_low=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "low")
+  mem_request_too_low=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "low")
 
-  # Log the modifications
-  #echo "Modified $namespace/$pod/$container"
-  echo "Recommendation $namespace/$pod/$container"
-  echo "  CPU: $cpurequest/$cpulimit => ${new_cpurequest}m/${new_cpulimit}m"
-  echo "  Memory: $memrequest/$memlimit => ${new_memrequest}Mi/${new_memlimit}Mi"
+  # Pretty, human-readable output
+  echo "──────────────────────────────────────────────────────────────"
+  echo "⚠️  Resource Optimization Suggestion"
+  echo "Namespace:         $namespace"
+  echo "Pod:               $pod"
+  echo "Container:         $container"
+  echo
+  echo "Current Resources:"
+  echo "  CPU:             request=${cpurequest_millicores}m   limit=${cpulimit_millicores}m"
+  echo "  Memory:          request=${memrequest_Mi}Mi          limit=${memlimit_Mi}Mi"
+  echo
+  echo "Observed Usage (pod-level):"
+  echo "  CPU actual:      ${cpu_real_millicores}m"
+  echo "  Memory actual:   ${mem_real_Mi}Mi"
+  echo
+  echo "Suggested New Resources:"
+  echo "  CPU:             request=${new_cpurequest}m   limit=${new_cpulimit}m"
+  echo "  Memory:          request=${new_memrequest}Mi  limit=${new_memlimit}Mi"
+  echo
+  echo "Reason:"
+  local printed_reason=0
+  if [ "$cpu_limit_too_high" = "1" ] || [ "$cpu_request_too_high" = "1" ]; then
+    echo "  • CPU allocation appears too high relative to observed usage"
+    printed_reason=1
+  fi
+  if [ "$mem_limit_too_high" = "1" ] || [ "$mem_request_too_high" = "1" ]; then
+    echo "  • Memory allocation appears too high relative to observed usage"
+    printed_reason=1
+  fi
+  if [ "$cpu_limit_too_low" = "1" ] || [ "$cpu_request_too_low" = "1" ]; then
+    echo "  • CPU resources might be too low for observed load"
+    printed_reason=1
+  fi
+  if [ "$mem_limit_too_low" = "1" ] || [ "$mem_request_too_low" = "1" ]; then
+    echo "  • Memory resources might be too low for observed load"
+    printed_reason=1
+  fi
+  if [ "$printed_reason" -eq 0 ]; then
+    echo "  • Resource settings differ noticeably from observed usage"
+  fi
+  echo "──────────────────────────────────────────────────────────────"
+  echo
 }
 
-for namespace in $(kubectl $kubeconfig get namespaces | tail -n +2 | awk '{print $1}' | grep -v -w -E "${exclude_namespaces//,/|}")
-do
-  for pod in $(kubectl $kubeconfig get pod -n "$namespace" | grep Running | awk '{print $1}')
-  do
-    for container in $(kubectl $kubeconfig get pod -n "$namespace" "$pod" -o jsonpath='{.spec.containers[*].name}')
-    do
-      if kubectl $kubeconfig get pod -n $namespace $p -o jsonpath='{.metadata.annotations.forbid_rl_modification}' | grep -q "yes"; then
+compute_cluster_capacity() {
+  local node_names
+  node_names=$("${KCTL[@]}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+
+  for node in $node_names; do
+    local cpu mem cpu_m mem_Mi
+
+    cpu=$("${KCTL[@]}" get node "$node" -o jsonpath='{.status.allocatable.cpu}' 2>/dev/null)
+    mem=$("${KCTL[@]}" get node "$node" -o jsonpath='{.status.allocatable.memory}' 2>/dev/null)
+
+    cpu_m=$(convert_cpu_to_millicores "$cpu")
+    mem_Mi=$(convert_memory_to_Mi "$mem")
+
+    [ -n "$cpu_m" ] && cluster_allocatable_cpu_m=$((cluster_allocatable_cpu_m + cpu_m))
+    [ -n "$mem_Mi" ] && cluster_allocatable_mem_Mi=$((cluster_allocatable_mem_Mi + mem_Mi))
+  done
+}
+
+# --- Main loop ---------------------------------------------------------------
+
+namespaces=$("${KCTL[@]}" get namespaces --no-headers 2>/dev/null | awk '{print $1}' | grep -v -w -E "${exclude_namespaces//,/|}")
+
+if [ "$verbose" -eq 1 ]; then
+  echo "Namespaces:"
+  echo "$namespaces"
+fi
+
+for namespace in $namespaces; do
+  pods=$("${KCTL[@]}" get pod -n "$namespace" --no-headers 2>/dev/null | awk '{print $1}')
+
+  for pod in $pods; do
+    pod_has_no_limits=0
+
+    if "${KCTL[@]}" get pod -n "$namespace" "$pod" -o jsonpath='{.metadata.annotations.forbid_rl_modification}' 2>/dev/null | grep -q "yes"; then
+      [ "$verbose" -eq 1 ] && echo "Skipping $namespace/$pod due to forbid_rl_modification"
+      continue
+    fi
+
+    top_line=$("${KCTL[@]}" top pod -n "$namespace" "$pod" 2>/dev/null | awk 'NR==2 {print $2, $3}')
+    if [[ -z "$top_line" ]]; then
+      [ "$verbose" -eq 1 ] && echo "No metrics for $namespace/$pod, skipping metrics-based logic"
+      cpu_real_millicores=0
+      mem_real_Mi=0
+    else
+      read -r cpu_real mem_real <<< "$top_line"
+      cpu_real_millicores=$(convert_cpu_to_millicores "$cpu_real")
+      mem_real_Mi=$(convert_memory_to_Mi "$mem_real")
+      [ -z "$cpu_real_millicores" ] && cpu_real_millicores=0
+      [ -z "$mem_real_Mi" ] && mem_real_Mi=0
+    fi
+
+    containers=$("${KCTL[@]}" get pod -n "$namespace" "$pod" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null)
+
+    for container in $containers; do
+      cpulimit=$("${KCTL[@]}" -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.limits.cpu}")
+      cpurequest=$("${KCTL[@]}" -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.requests.cpu}")
+      memlimit=$("${KCTL[@]}" -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.limits.memory}")
+      memrequest=$("${KCTL[@]}" -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.requests.memory}")
+
+      cpulimit_millicores=$(convert_cpu_to_millicores "$cpulimit")
+      cpurequest_millicores=$(convert_cpu_to_millicores "$cpurequest")
+      memlimit_Mi=$(convert_memory_to_Mi "$memlimit")
+      memrequest_Mi=$(convert_memory_to_Mi "$memrequest")
+
+      if [[ -z "$cpulimit" && -z "$memlimit" ]]; then
+        pod_has_no_limits=1
+      fi
+
+      if [[ -n "$cpulimit_millicores" && -n "$cpurequest_millicores" && -n "$memlimit_Mi" && -n "$memrequest_Mi" ]]; then
+        baseline_total_request_cpu_m=$((baseline_total_request_cpu_m + cpurequest_millicores))
+        baseline_total_limit_cpu_m=$((baseline_total_limit_cpu_m + cpulimit_millicores))
+        baseline_total_request_mem_Mi=$((baseline_total_request_mem_Mi + memrequest_Mi))
+        baseline_total_limit_mem_Mi=$((baseline_total_limit_mem_Mi + memlimit_Mi))
+      fi
+
+      if [[ -z "$cpulimit_millicores" || -z "$cpurequest_millicores" || -z "$memlimit_Mi" || -z "$memrequest_Mi" ]]; then
+        [ "$verbose" -eq 1 ] && echo "Missing RL for $namespace/$pod/$container, skipping optimization"
         continue
       fi
-		# Fetch resource limits and requests
-		cpulimit=$(kubectl $kubeconfig -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.limits.cpu}")
-		cpurequest=$(kubectl $kubeconfig -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.requests.cpu}")
-		memlimit=$(kubectl $kubeconfig -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.limits.memory}")
-		memrequest=$(kubectl $kubeconfig -n "$namespace" get pod "$pod" -o jsonpath="{.spec.containers[?(@.name=='$container')].resources.requests.memory}")
 
-		cpulimit_millicores=$(convert_cpu_to_millicores "$cpulimit")
-		cpurequest_millicores=$(convert_cpu_to_millicores "$cpurequest")
-		memlimit_Mi=$(convert_memory_to_Mi "$memlimit")
-		memrequest_Mi=$(convert_memory_to_Mi "$memrequest")
-		#mem_go_real=$(curl --silent -G '//https://prometheus.company.com/api/v1/query' --data-urlencode 'query=sum(container_memory_working_set_bytes{job="kubelet", metrics_path="/metrics/cadvisor", cluster="", namespace="$namespace", pod="$p", container!="", image!=""}) by (container)' | jq -r '.data.result[].value[1]' | awk '{sum = $1 + $2; printf("%.4f\n", sum/1024/1024/1024)}')
+      restart_count=$("${KCTL[@]}" -n "$namespace" get pod "$pod" -o jsonpath="{.status.containerStatuses[?(@.name=='$container')].restartCount}")
+      waiting_reason=$("${KCTL[@]}" -n "$namespace" get pod "$pod" -o jsonpath="{.status.containerStatuses[?(@.name=='$container')].state.waiting.reason}")
 
+      [ -z "$restart_count" ] && restart_count=0
 
-		if [ -z "$cpulimit_millicores" ] || [ -z "$cpurequest_millicores" ] || [ -z "$memlimit_Mi" ] || [ -z "$memrequest_Mi" ]; then
-		continue
-		fi
+      is_restarting=0
+      if [ "$restart_count" -ge "$RESTART_THRESHOLD" ] || [[ "$waiting_reason" == "CrashLoopBackOff" || "$waiting_reason" == "Error" ]]; then
+        is_restarting=1
+      fi
 
-	    # Get real CPU and memory usage (from 'kubectl top' output)
-	    read -r cpu_real mem_real rest_of_line <<< $(kubectl $kubeconfig top pod -n "$namespace" "$pod" | grep "$pod" | awk '{print $2, $3}')
+      is_cpu_hot=0
+      if [ "$cpulimit_millicores" -gt 0 ] && [ "$cpu_real_millicores" -gt $((cpulimit_millicores * CPU_HOT_THRESHOLD_PCT / 100)) ]; then
+        is_cpu_hot=1
+      fi
 
-	    cpu_real_millicores=$(convert_cpu_to_millicores "$cpu_real")
-	    mem_real_Mi=$(convert_memory_to_Mi "$mem_real")
+      if [ "$is_restarting" -eq 0 ] && [ "$is_cpu_hot" -eq 0 ]; then
+        [ "$verbose" -eq 1 ] && echo "Container $namespace/$pod/$container looks fine (restarts=$restart_count, cpu_hot=$is_cpu_hot)"
+        continue
+      fi
 
-		cpu_needs_fix=0
-		mem_needs_fix=0
+      cpu_limit_too_high=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "high")
+      cpu_request_too_high=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "high")
+      mem_limit_too_high=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "high")
+      mem_request_too_high=$(needs_fix "$memrequest_Mi" "$memrequest_Mi" "$scaling_factor" "high")
 
-		# Check for missing data and set to 0
-		if [ -z "$cpu_real_millicores" ]; then
-		cpu_real_millicores=0
-		fi
+      cpu_limit_too_low=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "low")
+      cpu_request_too_low=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "low")
+      mem_limit_too_low=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "low")
+      mem_request_too_low=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "low")
 
-		if [ -z "$mem_real_Mi" ]; then
-		mem_real_Mi=0
-		fi
+      # If anything looks off, propose a fix
+      if [ "$cpu_limit_too_low" = "1" ] || [ "$cpu_request_too_low" = "1" ] || \
+         [ "$mem_limit_too_low" = "1" ] || [ "$mem_request_too_low" = "1" ] || \
+         [ "$cpu_limit_too_high" = "1" ] || [ "$cpu_request_too_high" = "1" ] || \
+         [ "$mem_limit_too_high" = "1" ] || [ "$mem_request_too_high" = "1" ]; then
 
-		if [ -z "$mem_go_real" ]; then
-		mem_go_real=0
-		fi
-
-
-		cpu_limit_too_high=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "high")
-		cpu_request_too_high=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "high")
-		mem_limit_too_high=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "high")
-		mem_request_too_high=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "high")
-
-		cpu_limit_too_low=$(needs_fix "$cpu_real_millicores" "$cpulimit_millicores" "$scaling_factor" "low")
-		cpu_request_too_low=$(needs_fix "$cpu_real_millicores" "$cpurequest_millicores" "$scaling_factor" "low")
-		mem_limit_too_low=$(needs_fix "$mem_real_Mi" "$memlimit_Mi" "$scaling_factor" "low")
-		mem_request_too_low=$(needs_fix "$mem_real_Mi" "$memrequest_Mi" "$scaling_factor" "low")
-
-
-		if [ "$verbose" -eq 1 ]; then
-		echo "namespace: $namespace"
-		echo "cpulimit: $cpulimit"
-		echo "cpulimit_millicors: $cpulimit_millicores"
-		echo "cpurequest: $cpurequest"
-		echo "memlimit: $memlimit"
-		echo "memlimit_Mi: $memlimit_Mi"
-		echo "memrequest: $memrequest"
-		echo "memrequest_Mi: $memrequest_Mi"
-		echo "memlimit_Mi: $memlimit_Mi"
-		echo "cpurequest_millicores: $cpurequest_millicores"
-		echo "mem_go_real: $mem_go_real"
-		echo "cpu_real: $cpu_real"
-		echo "mem_real: $mem_real"
-		echo "cpu_needs_fix: $cpu_needs_fix"
-		echo "mem_needs_fix: $mem_needs_fix"
-		fi
-
-
-        if [ "$cpu_limit_too_low" = "1" ] || [ "$cpu_request_too_low" = "1" ] || [ "$mem_limit_too_low" = "1" ] || [ "$mem_request_too_low" = "1" ] || [ "$cpu_limit_too_high" = "1" ] || [ "$cpu_request_too_high" = "1" ] || [ "$mem_limit_too_high" = "1" ] || [ "$mem_request_too_high" = "1" ]; then
-            apply_fix "$namespace" "$pod" "$container" "$cpulimit_millicores" "$memlimit_Mi" "$cpu_real_millicores" "$mem_real_Mi" "$cpurequest_millicores" "$memrequest_Mi" 
-        fi
+        apply_fix "$namespace" "$pod" "$container" \
+          "$cpulimit_millicores" "$memlimit_Mi" \
+          "$cpu_real_millicores" "$mem_real_Mi" \
+          "$cpurequest_millicores" "$memrequest_Mi"
+      fi
 
     done
+
+    if [ "$pod_has_no_limits" -eq 1 ]; then
+      pods_without_limits=$((pods_without_limits + 1))
+    fi
+
   done
 done
 
-echo "Total request millicores needed to apply the patches: $total_cpu_needed_request"
-echo "Total request Mi needed to apply the patches: $total_mem_needed_request"
-echo "Total limit millicores needed to apply the patches: $total_cpu_needed_limit"
-echo "Total limit Mi needed to apply the patches: $total_mem_needed_limit"
+compute_cluster_capacity
+
+new_total_request_cpu_m=$((baseline_total_request_cpu_m + total_cpu_needed_request))
+new_total_limit_cpu_m=$((baseline_total_limit_cpu_m + total_cpu_needed_limit))
+new_total_request_mem_Mi=$((baseline_total_request_mem_Mi + total_mem_needed_request))
+new_total_limit_mem_Mi=$((baseline_total_limit_mem_Mi + total_mem_needed_limit))
+
+echo
+echo "===================== SUMMARY ====================="
+echo "Pods with NO resource limits set: $pods_without_limits"
+echo
+echo "Current total requested CPU:  ${baseline_total_request_cpu_m}m"
+echo "Current total limit CPU:      ${baseline_total_limit_cpu_m}m"
+echo "After suggested changes, req: ${new_total_request_cpu_m}m"
+echo "After suggested changes, lim: ${new_total_limit_cpu_m}m"
+echo
+echo "Current total requested Mem:  ${baseline_total_request_mem_Mi}Mi"
+echo "Current total limit Mem:      ${baseline_total_limit_mem_Mi}Mi"
+echo "After suggested changes, req: ${new_total_request_mem_Mi}Mi"
+echo "After suggested changes, lim: ${new_total_limit_mem_Mi}Mi"
+echo
+echo "Cluster allocatable CPU:      ${cluster_allocatable_cpu_m}m"
+echo "Cluster allocatable Mem:      ${cluster_allocatable_mem_Mi}Mi"
+echo
+if [ "$cluster_allocatable_cpu_m" -gt 0 ]; then
+  cpu_req_pct=$((new_total_request_cpu_m * 100 / cluster_allocatable_cpu_m))
+  cpu_lim_pct=$((new_total_limit_cpu_m * 100 / cluster_allocatable_cpu_m))
+  echo "CPU after suggested changes:"
+  echo "  Requests use ~${cpu_req_pct}% of allocatable"
+  echo "  Limits   use ~${cpu_lim_pct}% of allocatable"
+fi
+if [ "$cluster_allocatable_mem_Mi" -gt 0 ]; then
+  mem_req_pct=$((new_total_request_mem_Mi * 100 / cluster_allocatable_mem_Mi))
+  mem_lim_pct=$((new_total_limit_mem_Mi * 100 / cluster_allocatable_mem_Mi))
+  echo "Memory after suggested changes:"
+  echo "  Requests use ~${mem_req_pct}% of allocatable"
+  echo "  Limits   use ~${mem_lim_pct}% of allocatable"
+fi
+echo "==================================================="
