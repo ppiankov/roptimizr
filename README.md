@@ -1,6 +1,8 @@
 # 🧠 roptimizr.sh — Kubernetes Resource Optimizer
 
-roptimizr scans all Kubernetes pods (excluding system namespaces) and identifies containers that are:
+A tiny bash script that gives practical Kubernetes insights fast — especially when you’re too tired to think.
+
+## roptimizr scans all Kubernetes pods (excluding system namespaces) and identifies containers that are:
 	•	CPU-hot
 	•	Memory-heavy
 	•	Restarting
@@ -162,6 +164,36 @@ No obvious nodeAffinity hotspots detected.
 ```
 
 This helps DevOps engineers detect subtle cluster imbalance and affinity misconfigurations before they cause outages or weird scheduling behavior.
+
+
+# 🎛️ Filtering Low-Usage Pods on Default Resources
+
+Many Kubernetes system pods (e.g., cert-manager, metrics-server, small controllers) run with no explicit requests/limits and extremely low real usage.
+
+By default, roptimizr.sh skips these to avoid noisy or obvious suggestions.
+
+Example skipped pod:
+```bash
+CPU actual:   2m
+Mem actual:   24Mi
+Resources:    unset (default QoS)
+```
+
+To force reporting them anyway:
+
+```bash
+./roptimizr.sh --report-unset-lowusage
+```
+
+## When filtering is helpful
+	•	You want only meaningful, high-impact recommendations
+	•	You don’t want clutter from tiny defaulted pods
+	•	You’re debugging real issues (OOMKills, hot containers, affinity problems)
+
+## When reporting them is helpful
+	•	You want all pods to have explicit requests/limits
+	•	You’re preparing a compliance/hardening pass
+	•	You’re doing cluster cost optimization and want baselines for every workload
 
 ## ✨ Keywords
 
